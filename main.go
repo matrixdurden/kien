@@ -4,6 +4,7 @@ package main
 
 import (
 	"bufio"
+	"bytes"
 	"errors"
 	"fmt"
 	"io"
@@ -28,6 +29,10 @@ const usage = `usage:
   kien attach <name>
   kien list
   kien kill <name>`
+
+var errDetach = errors.New("detach")
+
+const detachKey = 0x00
 
 func main() {
 	if len(os.Args) < 2 {
@@ -126,6 +131,8 @@ func attachSession(args []string) error {
 		return err
 	}
 	defer conn.Close()
+	fmt.Fprint(os.Stdout, "\033[2J\033[H")
+	fmt.Fprintf(os.Stdout, "\033]0;kien | %s | Ctrl-Space detach\a", args[0])
 
 	state, err := term.MakeRaw(int(os.Stdin.Fd()))
 	if err != nil {
@@ -144,15 +151,45 @@ func attachSession(args []string) error {
 		}
 	}()
 
-	inputDone := make(chan struct{})
+	detached := make(chan struct{})
 	go func() {
-		_, _ = io.Copy(conn, os.Stdin)
+		if err := copyInput(conn, os.Stdin); errors.Is(err, errDetach) {
+			close(detached)
+		}
 		_ = conn.Close()
-		close(inputDone)
 	}()
 	_, err = io.Copy(os.Stdout, conn)
-	<-inputDone
+	select {
+	case <-detached:
+		fmt.Fprintf(os.Stdout, "\033[2J\033[HDetached from kien session %q.\r\n\033]0;kien\a", args[0])
+		return nil
+	default:
+	}
 	return err
+}
+
+func copyInput(destination io.Writer, source io.Reader) error {
+	buffer := make([]byte, 1024)
+	for {
+		count, readErr := source.Read(buffer)
+		if count > 0 {
+			input := buffer[:count]
+			if detachAt := bytes.IndexByte(input, detachKey); detachAt >= 0 {
+				if detachAt > 0 {
+					if _, err := destination.Write(input[:detachAt]); err != nil {
+						return err
+					}
+				}
+				return errDetach
+			}
+			if _, err := destination.Write(input); err != nil {
+				return err
+			}
+		}
+		if readErr != nil {
+			return readErr
+		}
+	}
 }
 
 func listSessions(args []string) error {
@@ -245,7 +282,6 @@ func serveSession(args []string) error {
 		shell = "/bin/sh"
 	}
 	command := exec.Command(shell)
-	command.SysProcAttr = &syscall.SysProcAttr{Setpgid: true}
 	terminal, err := pty.StartWithSize(command, &pty.Winsize{Rows: uint16(rows), Cols: uint16(cols)})
 	if err != nil {
 		return err
@@ -258,10 +294,12 @@ func serveSession(args []string) error {
 }
 
 type sessionServer struct {
-	terminal *os.File
-	command  *exec.Cmd
-	mu       sync.Mutex
-	attached bool
+	terminal      *os.File
+	command       *exec.Cmd
+	clients       map[net.Conn]struct{}
+	clientsMu     sync.Mutex
+	terminalMu    sync.Mutex
+	broadcastOnce sync.Once
 }
 
 func (s *sessionServer) accept(listener net.Listener) {
@@ -291,7 +329,7 @@ func (s *sessionServer) handle(conn net.Conn) {
 		_, _ = io.WriteString(conn, "ok\n")
 		conn.Close()
 	case "kill":
-		_ = syscall.Kill(-s.command.Process.Pid, syscall.SIGTERM)
+		_ = s.command.Process.Kill()
 		_, _ = io.WriteString(conn, "ok\n")
 		conn.Close()
 	case "resize":
@@ -310,31 +348,71 @@ func (s *sessionServer) handle(conn net.Conn) {
 		}
 		conn.Close()
 	case "attach":
-		s.mu.Lock()
-		if s.attached {
-			s.mu.Unlock()
-			_, _ = io.WriteString(conn, "error session is already attached\n")
-			conn.Close()
-			return
-		}
-		s.attached = true
-		s.mu.Unlock()
-		defer func() {
-			s.mu.Lock()
-			s.attached = false
-			s.mu.Unlock()
-		}()
 		_, _ = io.WriteString(conn, "ok\n")
-		go func() {
-			_, _ = io.Copy(s.terminal, reader)
-			_ = conn.Close()
-		}()
-		_, _ = io.Copy(conn, s.terminal)
+		s.addClient(conn)
+		s.broadcastOnce.Do(func() { go s.broadcast() })
+		_, _ = io.Copy(writerFunc(s.writeInput), reader)
+		s.removeClient(conn)
 		conn.Close()
 	default:
 		_, _ = io.WriteString(conn, "error unknown command\n")
 		conn.Close()
 	}
+}
+
+func (s *sessionServer) broadcast() {
+	buffer := make([]byte, 32768)
+	for {
+		count, err := s.terminal.Read(buffer)
+		if count > 0 {
+			for _, client := range s.snapshotClients() {
+				if _, writeErr := client.Write(buffer[:count]); writeErr != nil {
+					s.removeClient(client)
+					client.Close()
+				}
+			}
+		}
+		if err != nil {
+			return
+		}
+	}
+}
+
+func (s *sessionServer) writeInput(input []byte) (int, error) {
+	s.terminalMu.Lock()
+	defer s.terminalMu.Unlock()
+	return s.terminal.Write(input)
+}
+
+func (s *sessionServer) addClient(client net.Conn) {
+	s.clientsMu.Lock()
+	defer s.clientsMu.Unlock()
+	if s.clients == nil {
+		s.clients = make(map[net.Conn]struct{})
+	}
+	s.clients[client] = struct{}{}
+}
+
+func (s *sessionServer) removeClient(client net.Conn) {
+	s.clientsMu.Lock()
+	defer s.clientsMu.Unlock()
+	delete(s.clients, client)
+}
+
+func (s *sessionServer) snapshotClients() []net.Conn {
+	s.clientsMu.Lock()
+	defer s.clientsMu.Unlock()
+	clients := make([]net.Conn, 0, len(s.clients))
+	for client := range s.clients {
+		clients = append(clients, client)
+	}
+	return clients
+}
+
+type writerFunc func([]byte) (int, error)
+
+func (write writerFunc) Write(input []byte) (int, error) {
+	return write(input)
 }
 
 func dial(name, command string) (net.Conn, error) {
