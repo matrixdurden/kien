@@ -13,11 +13,17 @@ kien list            # print session names
 kien kill work       # terminate a session
 ```
 
+Start a specific terminal program instead of a shell:
+
+```sh
+kien new assistant -- opencode
+```
+
 `new` prints the session name after it starts. The shell comes from `$SHELL`, falling back to `/bin/sh`. A shell exit also ends its kien session.
 
 Any number of terminals may attach to the same session. Every attached terminal sees the same output and may send input, so coordinate with other users when typing. While attached, kien puts the terminal in raw mode and passes input and output through unchanged. Terminal resize events are forwarded to the PTY; the most recently resized terminal determines the shared size.
 
-The terminal title shows `kien | session-name | Ctrl-Space detach`. Press `Ctrl-Space` to detach without ending the shared shell.
+Press `Ctrl-Space` to detach without ending the shared shell.
 
 ## Linux support
 
